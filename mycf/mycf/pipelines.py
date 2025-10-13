@@ -1,3 +1,4 @@
+# mycf/pipelines.py
 import os
 import re
 import sqlite3
@@ -5,15 +6,9 @@ from datetime import datetime
 from scrapy.exceptions import DropItem
 from scrapy.exporters import CsvItemExporter
 
-
 # ---------- 持久化去重（SQLite） ----------
 class DedupePipeline:
-    """
-    基于 SQLite 的持久化去重：以 job_url 作为唯一键。
-    - 首次见到的 job_url -> 插入DB并放行
-    - 已存在的 job_url -> 直接 Drop，不进入后续导出
-    可在 settings.py 中通过 MYCF_SQLITE_PATH 自定义数据库路径。
-    """
+    """以 job_url 为主键去重；首次插入 DB 并放行，重复就丢弃。"""
     def __init__(self, db_path="mycf_jobs.sqlite"):
         self.db_path = db_path
         self.conn = None
@@ -24,7 +19,6 @@ class DedupePipeline:
         return cls(db_path=db_path)
 
     def open_spider(self, spider):
-        # 若设置了子目录，确保存在
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
@@ -74,49 +68,37 @@ class DedupePipeline:
                 )
             )
             self.conn.commit()
-            return item  # 新记录，放行到导出
+            return item
         except sqlite3.IntegrityError:
-            # 已存在，丢弃（不导出）
             raise DropItem(f"Duplicate job_url: {job_url}")
 
-
-# ---------- 按“种类/关键词”分文件导出 ----------
+# ---------- 按“关键词/分类”分文件导出 ----------
 class SplitExportPipeline:
     """
-    根据设置 MYCF_SPLIT_MODE 分文件导出：
-      - 'category'：按 item['category'] 分文件
-      - 'keyword' ：按 item['search_query'] 分文件
-
-    文件按日期存放：
-      output/by_category/<种类>/<YYYY-MM-DD>.csv
-      或
-      output/by_keyword/<关键词>/<YYYY-MM-DD>.csv
-
-    可在 settings.py 中配置：
-      - MYCF_OUTPUT_DIR（默认 'output'）
-      - MYCF_SPLIT_MODE（默认 'category'）
+    根据 MYCF_SPLIT_MODE 分文件导出：
+      - 'keyword'：output/by_keyword/<关键词>/<YYYY-MM-DD>.csv
+      - 'category'：output/by_category/<分类>/<YYYY-MM-DD>.csv
+    默认 settings.py 已设置为 'keyword'
     """
-    def __init__(self, base_dir="output", split_mode="category"):
+    def __init__(self, base_dir="output", split_mode="keyword"):
         self.base_dir = base_dir
         self.split_mode = split_mode
-        self.exporters = {}  # key -> CsvItemExporter
+        self.exporters = {}
         self.today = datetime.now().strftime("%Y-%m-%d")
 
     @classmethod
     def from_crawler(cls, crawler):
         base_dir = crawler.settings.get("MYCF_OUTPUT_DIR", "output")
-        split_mode = crawler.settings.get("MYCF_SPLIT_MODE", "category")  # 'category' or 'keyword'
+        split_mode = crawler.settings.get("MYCF_SPLIT_MODE", "keyword")
         return cls(base_dir=base_dir, split_mode=split_mode)
 
     def _sanitize(self, name: str) -> str:
         name = (name or "Unknown").strip()
-        # Windows 文件名安全
         return re.sub(r'[\\/:*?"<>|]+', "_", name)[:80] or "Unknown"
 
     def _key_from_item(self, item):
         if self.split_mode == "keyword":
             return self._sanitize(item.get("search_query"))
-        # 默认按分类
         return self._sanitize(item.get("category"))
 
     def _get_or_create_exporter(self, key: str) -> CsvItemExporter:
@@ -129,7 +111,7 @@ class SplitExportPipeline:
         file_path = os.path.join(dir_path, f"{self.today}.csv")
 
         file_exists = os.path.exists(file_path)
-        f = open(file_path, "ab")  # 追加写；不存在则创建
+        f = open(file_path, "ab")
         exporter = CsvItemExporter(f, include_headers_line=not file_exists)
         exporter.fields_to_export = [
             "search_query", "page_index",
@@ -138,8 +120,6 @@ class SplitExportPipeline:
             "job_url", "source_url",
         ]
         exporter.start_exporting()
-
-        # Scrapy 新版 CsvItemExporter 无 .file 属性，手动保存句柄便于关闭
         exporter._file = f
         self.exporters[key] = exporter
         return exporter
@@ -151,7 +131,6 @@ class SplitExportPipeline:
         return item
 
     def close_spider(self, spider):
-        # 逐个收尾并关闭文件
         for exporter in self.exporters.values():
             try:
                 exporter.finish_exporting()

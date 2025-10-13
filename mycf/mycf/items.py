@@ -4,6 +4,7 @@
 # https://docs.scrapy.org/en/latest/topics/items.html
 
 
+# mycf/items.py
 import scrapy
 
 class JobSummaryItem(scrapy.Item):
@@ -15,6 +16,10 @@ class JobSummaryItem(scrapy.Item):
     location = scrapy.Field()
     salary   = scrapy.Field()
     posted   = scrapy.Field()
+
+    employment_type = scrapy.Field()
+    seniority       = scrapy.Field()
+    category        = scrapy.Field()
 
     job_url    = scrapy.Field()
     source_url = scrapy.Field()

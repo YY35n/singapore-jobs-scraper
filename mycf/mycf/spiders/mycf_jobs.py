@@ -1,180 +1,292 @@
-import urllib.parse as ul
+# mycf/spiders/mycf_jobs.py
+# -*- coding: utf-8 -*-
+import os
 import re
+import urllib.parse as ul
 from datetime import datetime, timedelta, timezone
+
 import scrapy
-from scrapy_playwright.page import PageMethod
+from scrapy.http import JsonRequest
+from scrapy_playwright.page import PageMethod  # 仅在 DOM 兜底时用
+
 from mycf.items import JobSummaryItem
 
-# 新加坡时区
-SG_TZ = timezone(timedelta(hours=8))
 
 class MyCareersFutureSpider(scrapy.Spider):
     """
-    用法示例：
-      # 最近 1 天、3 页
-      python -m scrapy crawl mycf_jobs -O jobs.csv -a q=quant -a max_pages=3 -a within_days=1
+    用法：
+      # 读取 keywords.txt，按关键词分文件导出（settings 已设 MYCF_SPLIT_MODE=keyword）
+      # python -m scrapy crawl mycf_jobs -a keywords_file=keywords.txt -a within_days=7 -a max_pages=3
 
-      # 最近 3 天、按最新发布排序（默认）、5 页
-      python -m scrapy crawl mycf_jobs -O ds_3days.jsonl -a q="data scientist" -a within_days=3 -a max_pages=5
-
-      参数：
-        q            关键词，默认 "quant"
-        max_pages    翻页数，默认 3
-        within_days  仅保留最近 N 天岗位，默认 1
-        sortBy       排序，默认 new_posting_date（也可传 relevancy 等）
+      # 也可单关键词调试
+      # python -m scrapy crawl mycf_jobs -a q=quant -a within_days=7 -a max_pages=2
     """
     name = "mycf_jobs"
-    allowed_domains = ["mycareersfuture.gov.sg"]
+    allowed_domains = ["mycareersfuture.gov.sg", "api.mycareersfuture.gov.sg"]
 
     custom_settings = {
-        # 让 playwright page 对象可用（需要时可加截图/调试）
-        "PLAYWRIGHT_INCLUDE_PAGE": True,
-        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 60_000,
+        "PLAYWRIGHT_INCLUDE_PAGE": True,  # 仅 DOM 兜底调试用
+        "CONCURRENT_REQUESTS": 4,
+        "DOWNLOAD_DELAY": 0.8,
+        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 1.5,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.2,
+        "FEED_EXPORT_ENCODING": "utf-8",
     }
 
-    # -------- 生命周期 --------
-    def __init__(self, q="quant", max_pages=3, within_days=1,
-                 sortBy="new_posting_date", *args, **kwargs):
+    API_BASE = "https://api.mycareersfuture.gov.sg/v2/search"
+
+    def __init__(
+        self,
+        q=None,
+        keywords_file=None,
+        within_days=7,
+        max_pages=3,
+        use_api_only="True",
+        per_page=20,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.query = q
-        self.max_pages = int(max_pages)
-        self.within_days = int(within_days)
-        self.sortBy = sortBy
 
-        now_sg = datetime.now(SG_TZ)
-        # 仅保留 >= cutoff 的岗位
-        self.cutoff_dt = (now_sg - timedelta(days=self.within_days))
+        # --- 读取关键词列表 ---
+        kws = set()
+        if keywords_file and os.path.exists(keywords_file):
+            with open(keywords_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    kws.add(s)
+        if q:
+            kws.add(q.strip())
+        if not kws:
+            kws.add("quant")
+        self.queries = sorted(kws)
 
-    def start_requests(self):
-        url = self._build_search_url(page=0)
-        yield scrapy.Request(
-            url,
-            meta={
-                "playwright": True,
-                "page_index": 0,
-                "playwright_page_methods": [
-                    # 与你截图一致：等到 job card 出现
-                    PageMethod("wait_for_selector", "[data-testid='job-card']")
-                ],
-            },
-            callback=self.parse_list,
-        )
+        self.within_days = int(within_days or 7)
+        self.max_pages = int(max_pages or 3)
+        self.use_api_only = str(use_api_only).lower() in ("1", "true", "yes", "y")
+        self.per_page = int(per_page or 20)
 
-    # -------- 工具函数 --------
-    def _build_search_url(self, page: int) -> str:
+        self.sortBy = "new_posting_date"
+        self.tz = timezone(timedelta(hours=8))  # 新加坡/UTC+8
+        self.now = datetime.now(self.tz)
+
+    # ----------------- 工具 -----------------
+    def _build_search_url(self, query: str, page: int) -> str:
         base = "https://www.mycareersfuture.gov.sg/search"
-        params = {
-            "search": self.query,
-            "sortBy": self.sortBy,         # 默认 new_posting_date
-            "page": page,
-        }
+        params = {"search": query, "sortBy": self.sortBy, "page": page}
         return f"{base}?{ul.urlencode(params)}"
 
-    def _parse_posted_to_dt(self, text: str, time_attr: str | None) -> datetime | None:
-        """
-        尝试把发布时间解析为 datetime（SG_TZ）。
-        优先使用 <time datetime="...">；否则解析相对文案：
-        - just posted / today
-        - X minute(s)/hour(s)/day(s) ago
-        - 备选：具体日期 "10 Oct 2025" 或 "2025-10-10"
-        """
-        # 1) ISO8601
-        if time_attr:
-            try:
-                dt = datetime.fromisoformat(time_attr.strip())
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=SG_TZ)
-                return dt.astimezone(SG_TZ)
-            except Exception:
-                pass
+    def _build_api_payload(self, query: str, page_index: int):
+        return {
+            "search": query or "",
+            "sortBy": self.sortBy,
+            "filters": {},
+            "page": page_index,
+            "limit": self.per_page,
+        }
 
-        t = (text or "").strip().lower()
-        if not t:
+    def _api_request(self, query: str, page_index: int, source_url: str, method: str = "POST"):
+        """支持 POST/GET，两种页码起点（0/1），配合 dont_filter=True 允许重复尝试。"""
+        params = {
+            "limit": self.per_page,
+            "page": page_index,
+            "search": query or "",
+            "sortBy": self.sortBy,
+        }
+        payload = self._build_api_payload(query, page_index)
+
+        headers = {
+            "content-type": "application/json;charset=UTF-8",
+            "origin": "https://www.mycareersfuture.gov.sg",
+            "referer": source_url,
+            "accept": "application/json",
+            "accept-language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "x-requested-with": "XMLHttpRequest",
+        }
+
+        if method.upper() == "GET":
+            return scrapy.Request(
+                url=f"{self.API_BASE}?{ul.urlencode(params)}",
+                method="GET",
+                headers=headers,
+                cb_kwargs={"query": query, "page_index": page_index, "source_url": source_url},
+                callback=self.parse_api_json,
+                dont_filter=True,
+            )
+        else:
+            return JsonRequest(
+                url=self.API_BASE,
+                method="POST",
+                data=payload,
+                headers=headers,
+                cb_kwargs={"query": query, "page_index": page_index, "source_url": source_url},
+                callback=self.parse_api_json,
+                dont_filter=True,
+            )
+
+    def _posted_within_days(self, iso_or_text: str) -> bool:
+        """过滤最近 N 天（ISO + 相对时间）。解析失败默认保留。"""
+        if not iso_or_text:
+            return True
+        s = iso_or_text.strip().lower()
+        # ISO
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+        if m:
+            from datetime import datetime as dt
+            try:
+                d = dt.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                d = dt.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=self.tz)
+            return (self.now - d) <= timedelta(days=self.within_days)
+        # 相对时间
+        if "day" in s:
+            m2 = re.search(r"(\d+)\s*day", s)
+            if m2:
+                return int(m2.group(1)) <= self.within_days
+            if "yesterday" in s:
+                return self.within_days >= 1
+        if "hour" in s or "minute" in s:
+            return True
+        return True
+
+    def _to_abs_url(self, response, path_or_url):
+        if not path_or_url:
             return None
+        return response.urljoin(path_or_url)
 
-        if "just" in t or "today" in t:
-            return datetime.now(SG_TZ)
+    # ----------------- 入口 -----------------
+    def start_requests(self):
+        for query in self.queries:
+            if self.use_api_only:
+                referer = self._build_search_url(query, page=0)
+                for page_index in range(0, self.max_pages):
+                    # 多路线兜底：POST/GET × 页码 0/1
+                    yield self._api_request(query, page_index, referer, method="POST")
+                    yield self._api_request(query, page_index, referer, method="GET")
+                    yield self._api_request(query, page_index + 1, referer, method="POST")
+                    yield self._api_request(query, page_index + 1, referer, method="GET")
+            else:
+                # 只有在 USE_PLAYWRIGHT=1 时可用（DOM 兜底）
+                url = self._build_search_url(query, page=0)
+                yield scrapy.Request(
+                    url,
+                    meta={
+                        "playwright": True,
+                        "page_index": 0,
+                        "query": query,
+                        "playwright_page_methods": [
+                            PageMethod("wait_for_load_state", "domcontentloaded"),
+                            PageMethod("wait_for_selector", "main, #__next, body", timeout=60000),
+                        ],
+                    },
+                    callback=self.parse_list,
+                )
 
-        m = re.search(r"(\d+)\s*minute", t)
-        if m:
-            return datetime.now(SG_TZ) - timedelta(minutes=int(m.group(1)))
-
-        m = re.search(r"(\d+)\s*hour", t)
-        if m:
-            return datetime.now(SG_TZ) - timedelta(hours=int(m.group(1)))
-
-        m = re.search(r"(\d+)\s*day", t)
-        if m:
-            return datetime.now(SG_TZ) - timedelta(days=int(m.group(1)))
-
-        # 具体日期兜底
-        for fmt in ("%d %b %Y", "%Y-%m-%d"):
-            try:
-                return datetime.strptime((text or "").strip(), fmt).replace(tzinfo=SG_TZ)
-            except Exception:
-                continue
-        return None
-
-    # -------- 解析列表页 --------
+    # ----------------- DOM 兜底 -----------------
     def parse_list(self, response):
         page_index = response.meta.get("page_index", 0)
+        query = response.meta.get("query")
         source_url = response.url
 
-        cards = response.css("[data-testid='job-card']")
+        cards = response.css("[data-testid='job-card'], a[data-testid='job-card-link']")
         if not cards:
-            self.logger.warning(f"No cards on page {page_index}: {response.url}")
+            self.logger.warning(f"No cards on page {page_index}. Fallback to API: {response.url}")
+            yield self._api_request(query=query, page_index=page_index, source_url=source_url, method="POST")
+            yield self._api_request(query=query, page_index=page_index, source_url=source_url, method="GET")
+            return
 
         for card in cards:
-            # 链接：整卡 <a data-testid='job-card-link'>
-            href = card.xpath("ancestor::a[1]/@href").get() or \
-                   card.css("a[data-testid='job-card-link']::attr(href)").get()
-            job_url = response.urljoin(href) if href else None
+            title = (card.css("[data-testid='job-card__job-title']::text, [data-testid='job-card-title']::text, h2::text, h3::text").get(default="").strip()) or None
+            company = (card.css("[data-testid='job-card__company-hire-info']::text, [data-testid='company-hire-info']::text").get(default="").strip()) or None
+            location = (card.css("[data-testid='job-card__location']::text, [data-testid='job-card-location']::text").get(default="").strip()) or None
+            posted = (card.css("[data-testid='job-card__posted-date']::text, [data-testid='job-card-date']::text, time::attr(datetime)").get(default="").strip()) or None
+            href = card.attrib.get("href") or card.css("a::attr(href)").get()
+            job_url = self._to_abs_url(response, href)
 
-            # 公司
-            company = card.css("p[data-testid='company-hire-info']::text").get(default="").strip() or None
-
-            # 职位名
-            title = card.css("span[data-testid='job-card__job-title']::text").get(default="").strip() or None
-
-            # 地点 / 雇佣类型 / 职级 / 分类（如列表有）
-            location  = card.css("p[data-testid='job-card__location']::text").get(default="").strip() or None
-            # 如果你也想导出 emp_type / seniority / category，可以加进 Item，这里暂留示例：
-            # emp_type  = card.css("p[data-testid='job-card__employment-type']::text").get(default='').strip() or None
-            # seniority = card.css("p[data-testid='job-card__seniority']::text").get(default='').strip() or None
-            # category  = card.css("p[data-testid='job-card__category']::text").get(default='').strip() or None
-
-            # 发布时间
-            posted_text = card.css("[data-testid='job-card-date']::text").get(default="").strip()
-            time_attr   = card.css("time::attr(datetime)").get()
-            posted_dt   = self._parse_posted_to_dt(posted_text, time_attr)
-
-            # 过滤：仅保留最近 N 天
-            if posted_dt is not None and posted_dt < self.cutoff_dt:
+            if posted and not self._posted_within_days(posted):
                 continue
 
             yield JobSummaryItem(
-                search_query=self.query,
+                search_query=query,
                 page_index=page_index,
                 title=title,
                 company=company,
                 location=location,
-                salary=None,  # 列表通常无明确薪资
-                posted=posted_text or (posted_dt.isoformat() if posted_dt else None),
+                salary=None,
+                posted=posted,
+                employment_type=None,
+                seniority=None,
+                category=None,
                 job_url=job_url,
                 source_url=source_url,
             )
 
-        # 翻页
-        if page_index + 1 < self.max_pages:
-            next_url = self._build_search_url(page=page_index + 1)
-            yield scrapy.Request(
-                next_url,
-                meta={
-                    "playwright": True,
-                    "page_index": page_index + 1,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_selector", "[data-testid='job-card']")
-                    ],
-                },
-                callback=self.parse_list,
+    # ----------------- API 解析 -----------------
+    def parse_api_json(self, response, query, page_index, source_url):
+        """兼容 results/data/payload/result.results/jobs/items 等多种结构。"""
+        try:
+            data = response.json()
+        except Exception:
+            self.logger.warning(f"Non-JSON or parse error on {response.url}: {response.text[:200]}")
+            return
+
+        results = []
+        if isinstance(data, dict):
+            if isinstance(data.get("results"), list):
+                results = data["results"]
+            elif isinstance(data.get("data"), list):
+                results = data["data"]
+            elif isinstance(data.get("payload"), list):
+                results = data["payload"]
+            elif isinstance(data.get("result"), dict) and isinstance(data["result"].get("results"), list):
+                results = data["result"]["results"]
+            elif any(k in data for k in ("jobs", "items")):
+                results = data.get("jobs") or data.get("items") or []
+
+        if not results:
+            self.logger.info(f"No results on {response.url}. keys={list(data)[:8]}")
+            return
+
+        for j in results:
+            job_url_path = j.get("jobDetailsUrl") or j.get("seoUrl") or j.get("urlPath") or j.get("jobUrl")
+            job_url = self._to_abs_url(response, job_url_path)
+
+            company = None
+            company_raw = j.get("company")
+            if isinstance(company_raw, dict):
+                company = company_raw.get("name") or company_raw.get("companyName")
+            elif isinstance(company_raw, str):
+                company = company_raw
+
+            location = j.get("location") or j.get("postal") or j.get("jobLocation") or None
+
+            salary = None
+            min_salary = j.get("minSalary")
+            max_salary = j.get("maxSalary")
+            currency = j.get("salaryCurrency")
+            if min_salary or max_salary:
+                rng = f"{min_salary or ''}-{max_salary or ''}".strip("-")
+                salary = f"{rng} {currency or ''}".strip()
+
+            posted = j.get("postingDate") or j.get("postedDate") or j.get("createDate") or j.get("lastUpdatedDate")
+            if posted and not self._posted_within_days(posted):
+                continue
+
+            yield JobSummaryItem(
+                search_query=query,         # ★ 用关键词作为“分组键”
+                page_index=page_index,
+                title=j.get("title") or j.get("jobTitle"),
+                company=company,
+                location=location,
+                salary=salary,
+                posted=posted,
+                employment_type=j.get("employmentType"),
+                seniority=j.get("seniority"),
+                category=j.get("category") or j.get("jobCategory"),
+                job_url=job_url,
+                source_url=source_url,
             )
